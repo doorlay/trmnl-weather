@@ -13,6 +13,7 @@ import (
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/chromedp/chromedp"
+	"github.com/joho/godotenv"
 )
 
 const trmnlAPI = "https://usetrmnl.com/api/custom_plugins"
@@ -27,6 +28,11 @@ type HourData struct {
 }
 
 func main() {
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+
 	pluginUUID := os.Getenv("TRMNL_PLUGIN_UUID")
 	if pluginUUID == "" {
 		log.Fatal("TRMNL_PLUGIN_UUID environment variable is required")
