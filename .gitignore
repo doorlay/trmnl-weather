@@ -1,3 +1,4 @@
 .env
 webserver
 CLAUDE.md
+.DS_STORE
