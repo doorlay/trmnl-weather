@@ -46,6 +46,13 @@ func main() {
 	html := scrapeWeatherPage(url)
 	hours := parseHourlyHTML(html)
 
+	// If today doesn't have 8 hours, scrape tomorrow too
+	if len(hours) < 8 {
+		tomorrowURL := url + "?day=2"
+		tomorrowHTML := scrapeWeatherPage(tomorrowURL)
+		hours = append(hours, parseHourlyHTML(tomorrowHTML)...)
+	}
+
 	// Limit to 8 hours
 	if len(hours) > 8 {
 		hours = hours[:8]
@@ -90,6 +97,35 @@ func scrapeWeatherPage(url string) string {
 	return html
 }
 
+// formatTime normalizes AccuWeather time strings to "3 PM" style.
+// Handles "15:00" (24h) and passes through "3 PM" as-is.
+func formatTime(t string) string {
+	// Already in 12h format
+	if strings.Contains(t, "AM") || strings.Contains(t, "PM") {
+		return t
+	}
+	// Try parsing 24h format
+	parsed, err := time.Parse("15:04", strings.TrimSpace(t))
+	if err != nil {
+		// Try just the hour
+		parsed, err = time.Parse("15", strings.TrimSpace(t))
+		if err != nil {
+			return t
+		}
+	}
+	h := parsed.Hour()
+	suffix := "AM"
+	if h >= 12 {
+		suffix = "PM"
+	}
+	if h == 0 {
+		h = 12
+	} else if h > 12 {
+		h -= 12
+	}
+	return fmt.Sprintf("%d %s", h, suffix)
+}
+
 func parseHourlyHTML(html string) []HourData {
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
 	if err != nil {
@@ -108,7 +144,7 @@ func parseHourlyHTML(html string) []HourData {
 		precip := strings.TrimSpace(s.Find(".precip").First().Text())
 
 		results = append(results, HourData{
-			Time:        t,
+			Time:        formatTime(t),
 			Temperature: temp,
 			RealFeel:    realFeel,
 			Forecast:    forecast,
