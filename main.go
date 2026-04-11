@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,14 +45,19 @@ func main() {
 		url = "https://www.accuweather.com/en/us/capitol-hill/98102/hourly-weather-forecast/2254014"
 	}
 
+	// Fetch sunrise/sunset times for day/night icon selection
+	lat := os.Getenv("LATITUDE")
+	lon := os.Getenv("LONGITUDE")
+	sunrise, sunset := getSunTimes(lat, lon)
+
 	html := scrapeWeatherPage(url)
-	hours := parseHourlyHTML(html)
+	hours := parseHourlyHTML(html, sunrise, sunset)
 
 	// If today doesn't have 8 hours, scrape tomorrow too
 	if len(hours) < 8 {
 		tomorrowURL := url + "?day=2"
 		tomorrowHTML := scrapeWeatherPage(tomorrowURL)
-		hours = append(hours, parseHourlyHTML(tomorrowHTML)...)
+		hours = append(hours, parseHourlyHTML(tomorrowHTML, sunrise, sunset)...)
 	}
 
 	// Limit to 8 hours
@@ -126,7 +133,78 @@ func formatTime(t string) string {
 	return fmt.Sprintf("%d %s", h, suffix)
 }
 
-func parseHourlyHTML(html string) []HourData {
+// getSunTimes fetches today's sunrise/sunset hours from sunrise-sunset.org.
+// Returns sunrise and sunset as hour integers in local time (e.g. 6, 20).
+func getSunTimes(lat, lon string) (sunrise, sunset int) {
+	// Defaults if we can't fetch
+	sunrise, sunset = 6, 20
+
+	if lat == "" || lon == "" {
+		return
+	}
+
+	url := fmt.Sprintf("https://api.sunrise-sunset.org/json?lat=%s&lng=%s&formatted=0", lat, lon)
+	resp, err := http.Get(url)
+	if err != nil {
+		log.Printf("Warning: could not fetch sunrise/sunset: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+
+	var result struct {
+		Results struct {
+			Sunrise string `json:"sunrise"`
+			Sunset  string `json:"sunset"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return
+	}
+
+	// Parse ISO 8601 times and convert to local hour
+	if t, err := time.Parse(time.RFC3339, result.Results.Sunrise); err == nil {
+		sunrise = t.Local().Hour()
+	}
+	if t, err := time.Parse(time.RFC3339, result.Results.Sunset); err == nil {
+		sunset = t.Local().Hour()
+	}
+
+	return
+}
+
+// parseHour extracts the hour (0-23) from a time string like "3 PM" or "15:00".
+func parseHour(t string) int {
+	t = strings.TrimSpace(t)
+	if strings.Contains(t, "AM") || strings.Contains(t, "PM") {
+		isPM := strings.Contains(t, "PM")
+		numStr := strings.TrimSpace(strings.Replace(strings.Replace(t, "AM", "", 1), "PM", "", 1))
+		h, err := strconv.Atoi(numStr)
+		if err != nil {
+			return -1
+		}
+		if h == 12 {
+			h = 0
+		}
+		if isPM {
+			h += 12
+		}
+		return h
+	}
+	// Try 24h
+	parts := strings.Split(t, ":")
+	h, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return -1
+	}
+	return h
+}
+
+func parseHourlyHTML(html string, sunrise, sunset int) []HourData {
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
 	if err != nil {
 		log.Fatalf("Failed reading HTML: %v", err)
@@ -143,12 +221,16 @@ func parseHourlyHTML(html string) []HourData {
 		forecast := strings.TrimSpace(s.Find(".phrase").First().Text())
 		precip := strings.TrimSpace(s.Find(".precip").First().Text())
 
+		timeStr := formatTime(t)
+		hour := parseHour(timeStr)
+		isNight := hour < sunrise || hour >= sunset
+
 		results = append(results, HourData{
-			Time:        formatTime(t),
+			Time:        timeStr,
 			Temperature: temp,
 			RealFeel:    realFeel,
 			Forecast:    forecast,
-			Icon:        mapForecastToIcon(forecast),
+			Icon:        mapForecastToIcon(forecast, isNight),
 			Precip:      precip,
 		})
 	})
@@ -158,9 +240,8 @@ func parseHourlyHTML(html string) []HourData {
 
 // mapForecastToIcon maps AccuWeather forecast phrases to icon keywords
 // used by the Liquid template to select the correct SVG.
-// AccuWeather uses "Clear"/"Mostly Clear" at night instead of "Sunny"/"Mostly Sunny",
-// so we can infer day vs night from the phrase itself.
-func mapForecastToIcon(forecast string) string {
+// isNight is determined by comparing the hour against sunrise/sunset times.
+func mapForecastToIcon(forecast string, isNight bool) string {
 	f := strings.ToLower(forecast)
 
 	switch {
@@ -176,16 +257,20 @@ func mapForecastToIcon(forecast string) string {
 		return "cloud"
 	case strings.Contains(f, "wind"):
 		return "cloud"
-	case strings.Contains(f, "mostly cloudy") || strings.Contains(f, "partly sunny"):
-		return "partly_cloudy"
-	case strings.Contains(f, "mostly clear"):
-		return "cloudy_night"
-	case strings.Contains(f, "partly cloudy") || strings.Contains(f, "mostly sunny") || strings.Contains(f, "intermittent"):
+	case strings.Contains(f, "partly cloudy") || strings.Contains(f, "partly sunny") ||
+		strings.Contains(f, "mostly cloudy") || strings.Contains(f, "mostly sunny") ||
+		strings.Contains(f, "mostly clear") || strings.Contains(f, "intermittent"):
+		if isNight {
+			return "cloudy_night"
+		}
 		return "partly_cloudy"
 	case strings.Contains(f, "overcast") || strings.Contains(f, "cloudy"):
 		return "cloud"
 	case strings.Contains(f, "clear"):
-		return "clear_night"
+		if isNight {
+			return "clear_night"
+		}
+		return "sunny"
 	case strings.Contains(f, "sunny"):
 		return "sunny"
 	default:
