@@ -27,6 +27,7 @@ type HourData struct {
 	Forecast    string `json:"forecast"`
 	Icon        string `json:"icon"`
 	Precip      string `json:"precip"`
+	Rain        string `json:"rain"`
 }
 
 func main() {
@@ -95,6 +96,9 @@ func scrapeWeatherPage(url string) string {
 	err := chromedp.Run(ctx,
 		chromedp.Navigate(url),
 		chromedp.WaitVisible(`div.accordion-item.hour`, chromedp.ByQuery),
+		// Click all accordion items to expand them and load rain amounts
+		chromedp.Evaluate(`document.querySelectorAll('div.accordion-item.hour').forEach(el => el.click())`, nil),
+		chromedp.Sleep(2*time.Second),
 		chromedp.OuterHTML("html", &html, chromedp.ByQuery),
 	)
 	if err != nil {
@@ -221,6 +225,16 @@ func parseHourlyHTML(html string, sunrise, sunset int) []HourData {
 		forecast := strings.TrimSpace(s.Find(".phrase").First().Text())
 		precip := strings.TrimSpace(s.Find(".precip").First().Text())
 
+		// Extract rain amount from expanded panel
+		var rain string
+		s.Find(".accordion-item-content .panel p").Each(func(j int, p *goquery.Selection) {
+			valueText := strings.TrimSpace(p.Find(".value").Text())
+			label := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(p.Text()), valueText))
+			if label == "Rain" || label == "Snow" || label == "Ice" {
+				rain = valueText
+			}
+		})
+
 		timeStr := formatTime(t)
 		hour := parseHour(timeStr)
 		isNight := hour < sunrise || hour >= sunset
@@ -232,6 +246,7 @@ func parseHourlyHTML(html string, sunrise, sunset int) []HourData {
 			Forecast:    forecast,
 			Icon:        mapForecastToIcon(forecast, isNight),
 			Precip:      precip,
+			Rain:        rain,
 		})
 	})
 

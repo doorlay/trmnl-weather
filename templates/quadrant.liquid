@@ -30,7 +30,7 @@
       <span class="weather-temp">{{ hour.realFeel }}</span>
       <div class="weather-precip">
         <svg class="precip-drop" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><path d="M192 512C86 512 0 426 0 320C0 228.8 130.2 57.7 166.6 11.7C172.6 4.2 181.5 0 191.1 0L192 0L192.9 0C202.5 0 211.4 4.2 217.4 11.7C253.8 57.7 384 228.8 384 320C384 426 298 512 192 512z"/></svg>
-        <span>{{ hour.precip }}</span>
+        <span>{{ hour.precip }}{% if hour.rain != "" and hour.rain != "0.00 in" %} · {{ hour.rain }}{% endif %}</span>
       </div>
     </div>
     {% endfor %}
