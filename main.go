@@ -21,13 +21,30 @@ import (
 const trmnlAPI = "https://usetrmnl.com/api/custom_plugins"
 
 type HourData struct {
-	Time        string `json:"time"`
-	Temperature string `json:"temperature"`
-	RealFeel    string `json:"realFeel"`
-	Forecast    string `json:"forecast"`
-	Icon        string `json:"icon"`
-	Precip      string `json:"precip"`
-	Rain        string `json:"rain"`
+	Time        string
+	Temperature string
+	RealFeel    string
+	Forecast    string
+	Icon        string
+}
+
+type DailyData struct {
+	CurrentTemp     string
+	CurrentRealFeel string
+	CurrentForecast string
+	HighTemp        string
+	LowTemp         string
+	RainPercent     string
+}
+
+type DayOverview struct {
+	Date            string `json:"date"`
+	CurrentTemp     string `json:"currentTemp"`
+	CurrentRealFeel string `json:"currentRealFeel"`
+	CurrentIcon     string `json:"currentIcon"`
+	HighTemp        string `json:"highTemp"`
+	LowTemp         string `json:"lowTemp"`
+	RainPercent     string `json:"rainPercent"`
 }
 
 func main() {
@@ -41,37 +58,31 @@ func main() {
 		log.Fatal("TRMNL_PLUGIN_UUID environment variable is required")
 	}
 
-	url := os.Getenv("ACCUWEATHER_URL")
-	if url == "" {
-		url = "https://www.accuweather.com/en/us/capitol-hill/98102/hourly-weather-forecast/2254014"
+	hourlyURL := os.Getenv("ACCUWEATHER_URL")
+	if hourlyURL == "" {
+		hourlyURL = "https://www.accuweather.com/en/us/capitol-hill/98102/hourly-weather-forecast/2254014"
 	}
+	dailyURL := strings.Replace(hourlyURL, "/hourly-weather-forecast/", "/weather-forecast/", 1)
 
-	// Fetch sunrise/sunset times for day/night icon selection
 	lat := os.Getenv("LATITUDE")
 	lon := os.Getenv("LONGITUDE")
 	sunrise, sunset := getSunTimes(lat, lon)
 
-	html := scrapeWeatherPage(url)
-	hours := parseHourlyHTML(html, sunrise, sunset)
+	dailyHTML := scrapeDailyPage(dailyURL)
+	daily := parseDailyHTML(dailyHTML)
 
-	// If today doesn't have 8 hours, scrape tomorrow too
-	if len(hours) < 8 {
-		tomorrowURL := url + "?day=2"
-		tomorrowHTML := scrapeWeatherPage(tomorrowURL)
-		hours = append(hours, parseHourlyHTML(tomorrowHTML, sunrise, sunset)...)
-	}
+	hourlyHTML := scrapeWeatherPage(hourlyURL)
+	hours := parseHourlyHTML(hourlyHTML, sunrise, sunset)
 
-	// Limit to 8 hours
-	if len(hours) > 8 {
-		hours = hours[:8]
-	}
+	overview := combineOverview(daily, hours)
+	overview.Date = time.Now().Format("Mon, Jan 2")
 
 	location := os.Getenv("LOCATION_NAME")
 	if location == "" {
 		location = "Weather"
 	}
 
-	pushToTRMNL(pluginUUID, location, hours)
+	pushToTRMNL(pluginUUID, location, overview)
 }
 
 func scrapeWeatherPage(url string) string {
@@ -96,9 +107,6 @@ func scrapeWeatherPage(url string) string {
 	err := chromedp.Run(ctx,
 		chromedp.Navigate(url),
 		chromedp.WaitVisible(`div.accordion-item.hour`, chromedp.ByQuery),
-		// Click all accordion items to expand them and load rain amounts
-		chromedp.Evaluate(`document.querySelectorAll('div.accordion-item.hour').forEach(el => el.click())`, nil),
-		chromedp.Sleep(2*time.Second),
 		chromedp.OuterHTML("html", &html, chromedp.ByQuery),
 	)
 	if err != nil {
@@ -108,17 +116,88 @@ func scrapeWeatherPage(url string) string {
 	return html
 }
 
+// scrapeDailyPage loads AccuWeather's daily forecast page and returns the rendered HTML.
+// No clicks — clicking the daily-list-item replaces the static structure with a panel view.
+func scrapeDailyPage(url string) string {
+	allocOpts := append(
+		chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", "new"),
+		chromedp.Flag("disable-gpu", false),
+		chromedp.Flag("start-maximized", false),
+		chromedp.UserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
+	)
+
+	allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), allocOpts...)
+	defer cancel()
+
+	ctx, cancel := chromedp.NewContext(allocCtx)
+	defer cancel()
+
+	ctx, cancel = context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+
+	var html string
+	err := chromedp.Run(ctx,
+		chromedp.Navigate(url),
+		chromedp.WaitVisible(`.cur-con-weather-card`, chromedp.ByQuery),
+		chromedp.Sleep(1500*time.Millisecond),
+		chromedp.OuterHTML("html", &html, chromedp.ByQuery),
+	)
+	if err != nil {
+		log.Printf("Warning: daily page scrape failed: %v", err)
+		return ""
+	}
+
+	return html
+}
+
+func parseDailyHTML(html string) DailyData {
+	var d DailyData
+	if html == "" {
+		return d
+	}
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
+	if err != nil {
+		return d
+	}
+
+	card := doc.Find(".cur-con-weather-card").First()
+	d.CurrentTemp = strings.TrimSpace(card.Find(".temp").First().Text())
+	d.CurrentForecast = strings.TrimSpace(card.Find(".phrase").First().Text())
+
+	rfText := strings.Join(strings.Fields(card.Find(".real-feel").First().Text()), " ")
+	rfText = strings.TrimPrefix(rfText, "RealFeel®")
+	rfText = strings.TrimSpace(rfText)
+	if idx := strings.Index(rfText, "°"); idx >= 0 {
+		d.CurrentRealFeel = strings.TrimSpace(rfText[:idx+len("°")])
+	}
+
+	first := doc.Find(".daily-list-item").First()
+	hiText := strings.TrimSpace(first.Find(".temp-hi").First().Text())
+	loText := strings.TrimSpace(first.Find(".temp-lo").First().Text())
+	switch {
+	case strings.Contains(loText, "°"):
+		d.HighTemp = hiText
+		d.LowTemp = loText
+	case strings.EqualFold(loText, "Lo"):
+		d.LowTemp = hiText
+	case strings.EqualFold(loText, "Hi"):
+		d.HighTemp = hiText
+	default:
+		d.HighTemp = hiText
+	}
+
+	d.RainPercent = strings.TrimSpace(first.Find(".precip").First().Text())
+	return d
+}
+
 // formatTime normalizes AccuWeather time strings to "3 PM" style.
-// Handles "15:00" (24h) and passes through "3 PM" as-is.
 func formatTime(t string) string {
-	// Already in 12h format
 	if strings.Contains(t, "AM") || strings.Contains(t, "PM") {
 		return t
 	}
-	// Try parsing 24h format
 	parsed, err := time.Parse("15:04", strings.TrimSpace(t))
 	if err != nil {
-		// Try just the hour
 		parsed, err = time.Parse("15", strings.TrimSpace(t))
 		if err != nil {
 			return t
@@ -138,9 +217,7 @@ func formatTime(t string) string {
 }
 
 // getSunTimes fetches today's sunrise/sunset hours from sunrise-sunset.org.
-// Returns sunrise and sunset as hour integers in local time (e.g. 6, 20).
 func getSunTimes(lat, lon string) (sunrise, sunset int) {
-	// Defaults if we can't fetch
 	sunrise, sunset = 6, 20
 
 	if lat == "" || lon == "" {
@@ -170,7 +247,6 @@ func getSunTimes(lat, lon string) (sunrise, sunset int) {
 		return
 	}
 
-	// Parse ISO 8601 times and convert to local hour
 	if t, err := time.Parse(time.RFC3339, result.Results.Sunrise); err == nil {
 		sunrise = t.Local().Hour()
 	}
@@ -199,7 +275,6 @@ func parseHour(t string) int {
 		}
 		return h
 	}
-	// Try 24h
 	parts := strings.Split(t, ":")
 	h, err := strconv.Atoi(parts[0])
 	if err != nil {
@@ -223,17 +298,6 @@ func parseHourlyHTML(html string, sunrise, sunset int) []HourData {
 		realFeel = strings.TrimPrefix(realFeel, "RealFeel®")
 		realFeel = strings.TrimSpace(realFeel)
 		forecast := strings.TrimSpace(s.Find(".phrase").First().Text())
-		precip := strings.TrimSpace(s.Find(".precip").First().Text())
-
-		// Extract rain amount from expanded panel
-		var rain string
-		s.Find(".accordion-item-content .panel p").Each(func(j int, p *goquery.Selection) {
-			valueText := strings.TrimSpace(p.Find(".value").Text())
-			label := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(p.Text()), valueText))
-			if label == "Rain" || label == "Snow" || label == "Ice" {
-				rain = valueText
-			}
-		})
 
 		timeStr := formatTime(t)
 		hour := parseHour(timeStr)
@@ -245,17 +309,81 @@ func parseHourlyHTML(html string, sunrise, sunset int) []HourData {
 			RealFeel:    realFeel,
 			Forecast:    forecast,
 			Icon:        mapForecastToIcon(forecast, isNight),
-			Precip:      precip,
-			Rain:        rain,
 		})
 	})
 
 	return results
 }
 
-// mapForecastToIcon maps AccuWeather forecast phrases to icon keywords
-// used by the Liquid template to select the correct SVG.
-// isNight is determined by comparing the hour against sunrise/sunset times.
+// combineOverview computes the day's overview. Feels-like (current/high/low) is
+// aggregated from hourly hours of the remaining day. Rain percent comes from the
+// daily forecast page; rain timing and inches come from hourly. Hourly is
+// filtered to today (stops at midnight crossing).
+func combineOverview(daily DailyData, hours []HourData) DayOverview {
+	overview := DayOverview{
+		CurrentTemp: daily.CurrentTemp,
+		RainPercent: daily.RainPercent,
+	}
+	if overview.RainPercent == "" {
+		overview.RainPercent = "0%"
+	}
+
+	var today []HourData
+	if len(hours) > 0 {
+		today = append(today, hours[0])
+		prev := parseHour(hours[0].Time)
+		for _, h := range hours[1:] {
+			hr := parseHour(h.Time)
+			if hr < prev {
+				break
+			}
+			today = append(today, h)
+			prev = hr
+		}
+	}
+
+	if len(today) > 0 {
+		overview.CurrentIcon = today[0].Icon
+		overview.CurrentRealFeel = today[0].RealFeel
+		if overview.CurrentTemp == "" {
+			overview.CurrentTemp = today[0].Temperature
+		}
+	} else {
+		overview.CurrentIcon = mapForecastToIcon(daily.CurrentForecast, false)
+	}
+
+	highVal, lowVal := -999, 999
+	for _, h := range today {
+		v, ok := parseTemp(h.RealFeel)
+		if !ok {
+			continue
+		}
+		if v > highVal {
+			highVal = v
+			overview.HighTemp = strings.TrimSpace(h.RealFeel)
+		}
+		if v < lowVal {
+			lowVal = v
+			overview.LowTemp = strings.TrimSpace(h.RealFeel)
+		}
+	}
+
+	return overview
+}
+
+func parseTemp(s string) (int, bool) {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "°", "")
+	s = strings.ReplaceAll(s, "F", "")
+	s = strings.TrimSpace(s)
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// mapForecastToIcon maps AccuWeather forecast phrases to icon keywords.
 func mapForecastToIcon(forecast string, isNight bool) string {
 	f := strings.ToLower(forecast)
 
@@ -293,11 +421,17 @@ func mapForecastToIcon(forecast string, isNight bool) string {
 	}
 }
 
-func pushToTRMNL(pluginUUID string, location string, hours []HourData) {
+func pushToTRMNL(pluginUUID string, location string, overview DayOverview) {
 	payload := map[string]any{
 		"merge_variables": map[string]any{
-			"location": location,
-			"hours":    hours,
+			"location":        location,
+			"date":            overview.Date,
+			"currentTemp":     overview.CurrentTemp,
+			"currentRealFeel": overview.CurrentRealFeel,
+			"currentIcon":     overview.CurrentIcon,
+			"highTemp":        overview.HighTemp,
+			"lowTemp":         overview.LowTemp,
+			"rainPercent":     overview.RainPercent,
 		},
 	}
 
@@ -317,5 +451,5 @@ func pushToTRMNL(pluginUUID string, location string, hours []HourData) {
 		log.Fatalf("TRMNL API returned status %d", resp.StatusCode)
 	}
 
-	fmt.Printf("Pushed %d hours of weather data to TRMNL (status %d)\n", len(hours), resp.StatusCode)
+	fmt.Printf("Pushed daily overview to TRMNL (status %d)\n", resp.StatusCode)
 }
